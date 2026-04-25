@@ -63,20 +63,25 @@ for label, pattern in APPLIANCE_PATTERNS.items():
 # avg on  = 1 / p_on_to_off   minutes
 # avg off = 1 / p_off_to_on   minutes
 SCHEDULE_PARAMS = {
-    #                       p(on→off)   p(off→on)   init
-    "fridge":          (1/25,       1/55,       True ),  # ~31 % duty cycle
-    "microwave":       (1/2,        1/358,      False),  # ~4 uses/day, ~2 min each
-    "washing machine": (1/60,       1/1380,     False),  # ~1 cycle/day, ~60 min
-    "kettle":          (1/3,        1/285,      False),  # ~5 uses/day, ~3 min each
+    #                       p(on→off)  p(off→on)  init
+    "fridge":          (1/25,      1/55,      True ),  # ~31% duty cycle
+    "microwave":       (1/5,       1/100,     False),  # ~5% duty, ~8 uses/day, 5 min each
+    "washing machine": (1/60,      1/540,     False),  # ~10% duty, ~1 cycle/day, 60 min
+    "kettle":          (1/3,       1/57,      False),  # ~5% duty, ~15 uses/day, 3 min each
 }
 
-MINUTES_PER_DAY = 1440
+# Train uses 7 days to match AMPds_enriched; val/test use 1 day each
+SPLIT_CONFIG = {
+    "train": (42, "2013-11-21", 7),
+    "val":   (43, "2013-12-31", 1),
+    "test":  (44, "2012-08-23", 1),
+}
 
-def make_schedule(label, rng):
+def make_schedule(label, n_minutes, rng):
     p_off, p_on, init = SCHEDULE_PARAMS[label]
     state = init
-    schedule = np.zeros(MINUTES_PER_DAY, dtype=bool)
-    for t in range(MINUTES_PER_DAY):
+    schedule = np.zeros(n_minutes, dtype=bool)
+    for t in range(n_minutes):
         schedule[t] = state
         if state:
             state = rng.random() > p_off
@@ -88,21 +93,16 @@ def sample_power(label, n_on, rng):
     pool = power_pool[label]
     return rng.choice(pool, size=n_on, replace=True).astype(np.float32)
 
-# ── generate one DataFrame ─────────────────────────────────────────────────
-SPLIT_CONFIG = {
-    "train": (42, "2013-11-21"),
-    "val":   (43, "2013-12-31"),
-    "test":  (44, "2012-08-23"),
-}
-
-for split, (seed, date_str) in SPLIT_CONFIG.items():
+# ── generate one DataFrame per split ──────────────────────────────────────
+for split, (seed, date_str, n_days) in SPLIT_CONFIG.items():
+    n_minutes = n_days * 1440
     rng = np.random.default_rng(seed)
-    index = pd.date_range(date_str, periods=MINUTES_PER_DAY, freq="min", name="time")
+    index = pd.date_range(date_str, periods=n_minutes, freq="min", name="time")
     df = pd.DataFrame(index=index)
 
     for label in APPLIANCE_PATTERNS:
-        sched = make_schedule(label, rng)
-        col = np.zeros(MINUTES_PER_DAY, dtype=np.float32)
+        sched = make_schedule(label, n_minutes, rng)
+        col = np.zeros(n_minutes, dtype=np.float32)
         n_on = sched.sum()
         if n_on:
             col[sched] = sample_power(label, int(n_on), rng)
