@@ -1,0 +1,20 @@
+# Raw dataset (too large for git)
+WhiteD/
+
+# Claude Code memory
+.claude/
+
+# Generated results and checkpoints
+results/
+*.pth
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
