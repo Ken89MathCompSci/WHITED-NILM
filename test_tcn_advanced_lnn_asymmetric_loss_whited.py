@@ -37,15 +37,16 @@ class AsymmetricLoss(nn.Module):
     L_total = L_MSE + bce_lambda * L_BCE_asymmetric
 
     L_BCE_asymmetric = -1/N * sum[
-        alpha * y_i     * log(p_i)       +   <- positive (ON)  term
-        beta  * (1-y_i) * log(1 - p_i)       <- negative (OFF) term
+        alpha * pos_weight * y_i     * log(p_i)       +   <- positive (ON)  term
+        beta               * (1-y_i) * log(1 - p_i)       <- negative (OFF) term
     ]
 
     where p_i = sigmoid(output_i)
 
-    beta > alpha  -> penalise false positives (appliance rarely ON)
-    alpha > beta  -> penalise false negatives (missing ON events is costly)
-    alpha == beta -> symmetric BCE
+    Fix 3: pos_weight = num_off / num_on corrects for base class imbalance.
+    beta > alpha  -> penalise false positives  (appliance rarely ON)
+    alpha > beta  -> penalise false negatives  (missing ON events is costly)
+    alpha == beta -> symmetric BCE (scaled by pos_weight for imbalance only)
     """
     def __init__(self, alpha=0.5, beta=2.0, bce_lambda=0.1):
         super(AsymmetricLoss, self).__init__()
@@ -54,15 +55,16 @@ class AsymmetricLoss(nn.Module):
         self.bce_lambda = bce_lambda
         self.mse = nn.MSELoss()
 
-    def forward(self, outputs, targets, threshold_scaled):
+    def forward(self, outputs, targets, threshold_scaled, pos_weight=1.0):
         loss_mse = self.mse(outputs, targets)
 
         y = (targets >= threshold_scaled).float()
         p = torch.clamp(torch.sigmoid(outputs), min=1e-7, max=1.0 - 1e-7)
 
+        # Fix 3: pos_weight scales the ON-class term to correct imbalance
         loss_bce = -(
-            self.alpha * y       * torch.log(p) +
-            self.beta  * (1 - y) * torch.log(1 - p)
+            self.alpha * pos_weight * y       * torch.log(p) +
+            self.beta               * (1 - y) * torch.log(1 - p)
         ).mean()
 
         return loss_mse + self.bce_lambda * loss_bce
@@ -75,13 +77,25 @@ class AsymmetricLoss(nn.Module):
 # microwave:       ~5%  duty cycle — FN-penalised (don't miss ON spikes)
 # washing machine: ~10% duty cycle — FN-penalised (don't miss long cycles)
 # kettle:          ~5%  duty cycle — FN-penalised (don't miss short spikes)
+#
+# Fix 2: bce_lambda is now per-appliance.  Minority appliances get a larger
+#        value so the classification signal overrides the regression MSE.
+# Fix 1: appliances with ON-ratio < MINORITY_ON_RATIO save the model with
+#        the best val-F1 rather than best val-MSE.  Early stopping still
+#        uses val-MSE (decoupled from model saving).
+# Fix 3: pos_weight = num_off / num_on is computed from training data and
+#        multiplied into the positive-class BCE term at training time.
 
 APPLIANCE_LOSS_PARAMS = {
-    'fridge':          {'alpha': 0.75, 'beta': 0.75},  # balanced
-    'microwave':       {'alpha': 2.0,  'beta': 0.5},   # discourage missing ON spikes
-    'washing machine': {'alpha': 1.5,  'beta': 0.5},   # discourage missing long cycles
-    'kettle':          {'alpha': 2.0,  'beta': 0.5},   # discourage missing short spikes
+    'fridge':          {'alpha': 0.75, 'beta': 0.75, 'bce_lambda': 0.1},
+    'microwave':       {'alpha': 2.0,  'beta': 0.5,  'bce_lambda': 1.0},
+    'washing machine': {'alpha': 1.5,  'beta': 0.5,  'bce_lambda': 0.5},
+    'kettle':          {'alpha': 2.0,  'beta': 0.5,  'bce_lambda': 1.0},
 }
+
+# Fix 1: appliances whose training ON-ratio is below this threshold save the
+# best-F1 checkpoint; balanced appliances save the best-MSE checkpoint.
+MINORITY_ON_RATIO = 0.20
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +145,6 @@ def get_threshold_for_appliance(appliance_name):
 def train_on_appliance(data_dict, appliance_name, window_size=100,
                        hidden_size=64, num_layers=2, dt=0.1,
                        num_channels=None, kernel_size=3, dropout=0.2,
-                       bce_lambda=0.1,
                        epochs=80, lr=0.001, patience=20,
                        save_dir='models/tcn_advanced_lnn_asymmetric_loss_whited'):
     if num_channels is None:
@@ -172,15 +185,29 @@ def train_on_appliance(data_dict, appliance_name, window_size=100,
     raw_threshold    = get_threshold_for_appliance(appliance_name)
     threshold_scaled = float(y_scaler.transform([[raw_threshold]])[0][0])
 
-    loss_p = APPLIANCE_LOSS_PARAMS[appliance_name]
+    loss_p     = APPLIANCE_LOSS_PARAMS[appliance_name]
+    bce_lambda = loss_p['bce_lambda']
     print(f"Asymmetric BCE -> alpha={loss_p['alpha']}  beta={loss_p['beta']}  "
           f"bce_lambda={bce_lambda}  "
           f"({'FP-penalised' if loss_p['beta'] > loss_p['alpha'] else 'FN-penalised'})")
 
-    num_on  = (y_train >= threshold_scaled).sum()
-    num_off = (y_train <  threshold_scaled).sum()
+    # --- Fix 3: compute pos_weight from training class counts ---------------
+    num_on  = int((y_train >= threshold_scaled).sum())
+    num_off = int((y_train <  threshold_scaled).sum())
+    pos_weight        = float(num_off / max(num_on, 1))
+    pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=device)
     print(f"Threshold (raw): {raw_threshold}W  |  Threshold (scaled): {threshold_scaled:.4f}"
-          f"  |  ON: {num_on}  |  OFF: {num_off}")
+          f"  |  ON: {num_on}  |  OFF: {num_off}  |  pos_weight: {pos_weight:.2f}")
+
+    # --- Fix 1: choose model-saving criterion based on ON-ratio -------------
+    on_ratio          = num_on / max(num_on + num_off, 1)
+    use_f1_for_saving = on_ratio < MINORITY_ON_RATIO
+    if use_f1_for_saving:
+        print(f"  -> ON-ratio={on_ratio:.2%} < {MINORITY_ON_RATIO:.0%}: "
+              f"saving best-F1 model  |  early-stopping on val MSE")
+    else:
+        print(f"  -> ON-ratio={on_ratio:.2%} >= {MINORITY_ON_RATIO:.0%}: "
+              f"saving best-MSE model  |  early-stopping on val MSE")
 
     train_loader = torch.utils.data.DataLoader(
         WHITEDDataset(X_train, y_train), batch_size=32, shuffle=True)
@@ -203,7 +230,10 @@ def train_on_appliance(data_dict, appliance_name, window_size=100,
         optimizer, mode='min', factor=0.5, patience=3)
 
     history = {'train_loss': [], 'val_loss': [], 'val_metrics': []}
-    best_val_loss = float('inf')
+
+    # Fix 1: early stopping always on val MSE; saving on F1 or MSE per appliance
+    best_val_loss    = float('inf')
+    best_save_metric = -1.0 if use_f1_for_saving else float('inf')
     counter = 0
     best_model_path = os.path.join(
         save_dir,
@@ -219,7 +249,8 @@ def train_on_appliance(data_dict, appliance_name, window_size=100,
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, targets, threshold_scaled)
+            # Fix 3: pass pos_weight into the loss
+            loss = criterion(outputs, targets, threshold_scaled, pos_weight_tensor)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -257,9 +288,29 @@ def train_on_appliance(data_dict, appliance_name, window_size=100,
               f"Val SAE: {metrics['sae']:.2f}, Val F1: {metrics['f1']:.4f}, "
               f"Val Precision: {metrics['precision']:.4f}, Val Recall: {metrics['recall']:.4f}")
 
+        # --- Fix 1: decouple early stopping from model saving ---------------
+        # Early stopping: always tracks val MSE
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             counter = 0
+        else:
+            counter += 1
+            print(f"EarlyStopping counter: {counter} out of {patience}")
+            if counter >= patience:
+                print("Early stopping triggered")
+                break
+
+        # Model saving: best F1 for minority appliances, best MSE for balanced
+        if use_f1_for_saving:
+            should_save = metrics['f1'] > best_save_metric
+            if should_save:
+                best_save_metric = metrics['f1']
+        else:
+            should_save = avg_val_loss < best_save_metric
+            if should_save:
+                best_save_metric = avg_val_loss
+
+        if should_save:
             save_model(model,
                        {'input_size': 1, 'output_size': 1,
                         'hidden_size': hidden_size, 'num_layers': num_layers, 'dt': dt,
@@ -268,19 +319,17 @@ def train_on_appliance(data_dict, appliance_name, window_size=100,
                        {'lr': lr, 'epochs': epochs, 'patience': patience,
                         'window_size': window_size, 'appliance': appliance_name,
                         'alpha': loss_p['alpha'], 'beta': loss_p['beta'],
-                        'bce_lambda': bce_lambda},
+                        'bce_lambda': bce_lambda, 'pos_weight': pos_weight,
+                        'use_f1_for_saving': use_f1_for_saving},
                        metrics, best_model_path)
-            print(f"Model saved to {best_model_path}")
-        else:
-            counter += 1
-            print(f"EarlyStopping counter: {counter} out of {patience}")
-            if counter >= patience:
-                print("Early stopping triggered")
-                break
+            save_criterion = (f"F1={metrics['f1']:.4f}" if use_f1_for_saving
+                              else f"MSE={avg_val_loss:.6f}")
+            print(f"Model saved ({save_criterion}) to {best_model_path}")
 
     print("Training completed!")
 
-    print(f"Loading best val loss model from {best_model_path} for test evaluation...")
+    criterion_label = 'F1' if use_f1_for_saving else 'val-loss'
+    print(f"Loading best {criterion_label} model from {best_model_path} for test evaluation...")
     checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
 
@@ -382,8 +431,14 @@ def train_on_appliance(data_dict, appliance_name, window_size=100,
         'dataset': 'WHITED',
         'loss': 'MSE + Asymmetric BCE',
         'loss_params': {
-            'alpha': loss_p['alpha'], 'beta': loss_p['beta'], 'bce_lambda': bce_lambda,
+            'alpha': loss_p['alpha'], 'beta': loss_p['beta'],
+            'bce_lambda': bce_lambda, 'pos_weight': pos_weight,
             'mode': 'FP-penalised' if loss_p['beta'] > loss_p['alpha'] else 'FN-penalised'
+        },
+        'model_selection': {
+            'criterion': 'best_val_f1' if use_f1_for_saving else 'best_val_mse',
+            'on_ratio': float(on_ratio),
+            'early_stopping': 'val_mse',
         },
         'window_size': window_size,
         'model_params': {
@@ -410,7 +465,7 @@ def train_on_appliance(data_dict, appliance_name, window_size=100,
 
 def test_on_all_appliances(window_size=100, hidden_size=64, num_layers=2, dt=0.1,
                            num_channels=None, kernel_size=3, dropout=0.2,
-                           bce_lambda=0.1, epochs=80, lr=0.001, patience=20):
+                           epochs=80, lr=0.001, patience=20):
     if num_channels is None:
         num_channels = [32, 64, 128]
 
@@ -422,11 +477,12 @@ def test_on_all_appliances(window_size=100, hidden_size=64, num_layers=2, dt=0.1
     appliances = ['fridge', 'microwave', 'washing machine', 'kettle']
 
     for appliance_name in appliances:
-        lp = APPLIANCE_LOSS_PARAMS[appliance_name]
+        lp   = APPLIANCE_LOSS_PARAMS[appliance_name]
         mode = 'FP-penalised' if lp['beta'] > lp['alpha'] else 'FN-penalised'
         print(f"\n{'='*60}")
         print(f"Testing TCN-Advanced-LNN (Asymmetric Loss) on {appliance_name}")
-        print(f"  alpha={lp['alpha']}  beta={lp['beta']}  [{mode}]")
+        print(f"  alpha={lp['alpha']}  beta={lp['beta']}  "
+              f"bce_lambda={lp['bce_lambda']}  [{mode}]")
         print(f"{'='*60}\n")
 
         appliance_dir = os.path.join(base_save_dir, appliance_name.replace(' ', '_'))
@@ -443,7 +499,6 @@ def test_on_all_appliances(window_size=100, hidden_size=64, num_layers=2, dt=0.1
                 num_channels=num_channels,
                 kernel_size=kernel_size,
                 dropout=dropout,
-                bce_lambda=bce_lambda,
                 epochs=epochs,
                 lr=lr,
                 patience=patience,
@@ -468,7 +523,14 @@ def test_on_all_appliances(window_size=100, hidden_size=64, num_layers=2, dt=0.1
         'dataset': 'WHITED',
         'loss': 'MSE + Asymmetric BCE',
         'loss_params': {app: APPLIANCE_LOSS_PARAMS[app] for app in appliances},
-        'bce_lambda': bce_lambda,
+        'model_selection': {
+            'minority_on_ratio_threshold': MINORITY_ON_RATIO,
+            'description': (
+                f'Appliances with ON-ratio < {MINORITY_ON_RATIO:.0%} save the '
+                f'best-F1 checkpoint; others save the best-MSE checkpoint. '
+                f'Early stopping always uses val MSE.'
+            ),
+        },
         'dataset_splits': {
             'training':   {'date': '2013-11-21', 'days': 7},
             'validation': {'date': '2013-12-31', 'days': 1},
@@ -507,7 +569,6 @@ if __name__ == "__main__":
         num_channels=[32, 64, 128],
         kernel_size=3,
         dropout=0.2,
-        bce_lambda=0.1,
         epochs=80,
         lr=0.001,
         patience=20
