@@ -105,11 +105,11 @@ MINORITY_ON_RATIO = 0.20
 def load_whited_specific_splits():
     print("Loading WHITED data with specific splits...")
 
-    with open('data/WHITED/train.pkl', 'rb') as f:
+    with open('data/WHITED_enriched/train.pkl', 'rb') as f:
         train_data = pickle.load(f)[0]
-    with open('data/WHITED/val.pkl', 'rb') as f:
+    with open('data/WHITED_enriched/val.pkl', 'rb') as f:
         val_data = pickle.load(f)[0]
-    with open('data/WHITED/test.pkl', 'rb') as f:
+    with open('data/WHITED_enriched/test.pkl', 'rb') as f:
         test_data = pickle.load(f)[0]
 
     print(f"Train date range: {train_data.index.min()} to {train_data.index.max()}")
@@ -555,8 +555,8 @@ def test_on_all_appliances(window_size=100, hidden_size=64, num_layers=2, dt=0.1
 if __name__ == "__main__":
     print("Testing TCN-Advanced-LNN with Asymmetric Loss on WHITED dataset...")
 
-    for f in ['data/WHITED/train.pkl', 'data/WHITED/val.pkl',
-              'data/WHITED/test.pkl']:
+    for f in ['data/WHITED_enriched/train.pkl', 'data/WHITED_enriched/val.pkl',
+              'data/WHITED_enriched/test.pkl']:
         if not os.path.exists(f):
             print(f"Error: {f} not found!")
             sys.exit(1)

@@ -187,11 +187,11 @@ class MultiApplianceDataset(torch.utils.data.Dataset):
 
 def load_data():
     print("Loading WHITED data...")
-    with open('data/WHITED/train.pkl', 'rb') as f:
+    with open('data/WHITED_enriched/train.pkl', 'rb') as f:
         train_data = pickle.load(f)[0]
-    with open('data/WHITED/val.pkl', 'rb') as f:
+    with open('data/WHITED_enriched/val.pkl', 'rb') as f:
         val_data = pickle.load(f)[0]
-    with open('data/WHITED/test.pkl', 'rb') as f:
+    with open('data/WHITED_enriched/test.pkl', 'rb') as f:
         test_data = pickle.load(f)[0]
 
     print(f"Train date range: {train_data.index.min()} to {train_data.index.max()}")
@@ -555,8 +555,8 @@ def _plot_training(history, test_metrics, save_dir):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    for f in ['data/WHITED/train.pkl', 'data/WHITED/val.pkl',
-              'data/WHITED/test.pkl']:
+    for f in ['data/WHITED_enriched/train.pkl', 'data/WHITED_enriched/val.pkl',
+              'data/WHITED_enriched/test.pkl']:
         if not os.path.exists(f):
             print(f"Error: {f} not found!")
             sys.exit(1)

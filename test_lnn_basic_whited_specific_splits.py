@@ -96,7 +96,7 @@ def load_data():
     print("Loading WHITED data (specific splits)...")
     splits = {}
     for split in ('train', 'val', 'test'):
-        with open(f'data/WHITED/{split}.pkl', 'rb') as f:
+        with open(f'data/WHITED_enriched/{split}.pkl', 'rb') as f:
             splits[split] = pickle.load(f)[0]
     print(f"  Train: {splits['train'].index.min()} -> {splits['train'].index.max()}")
     print(f"  Val  : {splits['val'].index.min()} -> {splits['val'].index.max()}")
@@ -498,9 +498,9 @@ def main():
         print_table(results)
         return
 
-    for fp in ['data/WHITED/train.pkl',
-               'data/WHITED/val.pkl',
-               'data/WHITED/test.pkl']:
+    for fp in ['data/WHITED_enriched/train.pkl',
+               'data/WHITED_enriched/val.pkl',
+               'data/WHITED_enriched/test.pkl']:
         if not os.path.exists(fp):
             print(f'ERROR: {fp} not found')
             sys.exit(1)
