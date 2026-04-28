@@ -63,7 +63,7 @@ PATIENCE      = 20
 LR            = 1e-3
 BATCH         = 32
 WIN           = 100
-STRIDE        = 5
+STRIDE        = 2
 
 WARMUP_EPOCHS = 20
 
@@ -79,14 +79,14 @@ EPSILON_Q = 30.0   # tolerance on Q sum violation (VAR)
 APPLIANCES = ['fridge', 'microwave', 'washing machine', 'kettle']
 
 THRESHOLDS = {
-    'fridge':           50.0,
-    'microwave':        50.0,
-    'washing machine':   5.0,
-    'kettle':           50.0,
+    'fridge':           100.0,
+    'microwave':         50.0,
+    'washing machine':    5.0,
+    'kettle':            50.0,
 }
 
-BCE_LAMBDA = {'fridge': 0.3, 'microwave': 0.3, 'washing machine': 0.3, 'kettle': 0.3}
-BCE_ALPHA  = {'fridge': 1.5, 'microwave': 1.5, 'washing machine': 4.0, 'kettle': 1.5}
+BCE_LAMBDA = {'fridge': 0.1, 'microwave': 0.5, 'washing machine': 0.3, 'kettle': 1.0}
+BCE_ALPHA  = {'fridge': 0.8, 'microwave': 2.5, 'washing machine': 4.0, 'kettle': 3.0}
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +616,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir  = f"models/pinn_reactive_power_lnn_whited_{timestamp}"
+    save_dir  = f"models/pinn_reactive_power_lnn_whited_v2_{timestamp}"
 
     data_dict = load_data()
 
