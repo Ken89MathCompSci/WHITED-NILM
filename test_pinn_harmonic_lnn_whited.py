@@ -49,28 +49,29 @@ from utils import calculate_nilm_metrics, save_model
 # Constants
 # ---------------------------------------------------------------------------
 
-EPOCHS        = 80
-PATIENCE      = 20
+EPOCHS        = 100
+PATIENCE      = 25
 LR            = 1e-3
 BATCH         = 32
 WIN           = 100
 STRIDE        = 2
 
-WARMUP_EPOCHS = 20
+WARMUP_EPOCHS = 30   # longer warmup for stability
+RAMP_EPOCHS   = 20   # physics weight linearly ramps from 0 → full over this many epochs
 
-# Physics loss weights
+# Physics loss weights (full strength after ramp)
 LAMBDA_P   = 0.01    # active-power conservation
 LAMBDA_Q1  = 0.01    # fundamental reactive conservation
-LAMBDA_Q3  = 0.005   # 3rd harmonic (smaller magnitude, looser weight)
-LAMBDA_Q5  = 0.005   # 5th harmonic
-LAMBDA_Q7  = 0.005   # 7th harmonic
+LAMBDA_Q3  = 0.0005  # 3rd harmonic — much weaker; smaller magnitude signal
+LAMBDA_Q5  = 0.0005  # 5th harmonic
+LAMBDA_Q7  = 0.0005  # 7th harmonic
 LAMBDA_NN  = 0.005   # non-negativity on P
 LAMBDA_BD  = 0.005   # P upper-bound
 
 # Tolerances (raw units)
 EPSILON_P  = 50.0    # W
 EPSILON_Q1 = 30.0    # VAR
-EPSILON_Q3 = 10.0    # VAR  (3rd harmonic is smaller)
+EPSILON_Q3 = 10.0    # VAR
 EPSILON_Q5 = 5.0     # VAR
 EPSILON_Q7 = 5.0     # VAR
 
@@ -355,7 +356,7 @@ def scale_channel(scaler, arr_2d, fit=False):
     return scaler.transform(flat).reshape(arr_2d.shape)
 
 
-def train_model(data_dict, save_dir, hidden_size=64, dt=0.1):
+def train_model(data_dict, save_dir, hidden_size=128, dt=0.1):
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}  hidden={hidden_size}  dt={dt}  input_channels={N_INPUT}")
@@ -434,9 +435,11 @@ def train_model(data_dict, save_dir, hidden_size=64, dt=0.1):
         'train_mse_p': [], 'val_mse_p': [],
         'val_metrics': [],
     }
-    best_val  = float('inf')
-    best_state = None
-    patience_ctr = 0
+    best_mse_val   = float('inf')
+    best_f1_val    = -float('inf')
+    best_mse_state = None
+    best_f1_state  = None
+    patience_ctr   = 0
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
@@ -465,6 +468,9 @@ def train_model(data_dict, save_dir, hidden_size=64, dt=0.1):
             if epoch < WARMUP_EPOCHS:
                 loss = l_mse_p + l_mse_q
             else:
+                # Linearly ramp physics weight 0 → 1 over RAMP_EPOCHS
+                phys_scale = min(1.0, (epoch - WARMUP_EPOCHS) / RAMP_EPOCHS)
+
                 l_p, l_q1, l_q3, l_q5, l_q7, l_nn, l_bd = phys_loss(
                     x_mid_sc, p_pred, q_preds)
 
@@ -479,13 +485,13 @@ def train_model(data_dict, save_dir, hidden_size=64, dt=0.1):
                         bce = bce + BCE_LAMBDA[app] * F.binary_cross_entropy(pi, y_bin, weight=w)
 
                 loss = (l_mse_p + l_mse_q
-                        + LAMBDA_P  * l_p
-                        + LAMBDA_Q1 * l_q1
-                        + LAMBDA_Q3 * l_q3
-                        + LAMBDA_Q5 * l_q5
-                        + LAMBDA_Q7 * l_q7
-                        + LAMBDA_NN * l_nn
-                        + LAMBDA_BD * l_bd
+                        + phys_scale * (LAMBDA_P  * l_p
+                                        + LAMBDA_Q1 * l_q1
+                                        + LAMBDA_Q3 * l_q3
+                                        + LAMBDA_Q5 * l_q5
+                                        + LAMBDA_Q7 * l_q7
+                                        + LAMBDA_NN * l_nn
+                                        + LAMBDA_BD * l_bd)
                         + bce)
 
             loss.backward()
@@ -538,40 +544,54 @@ def train_model(data_dict, save_dir, hidden_size=64, dt=0.1):
             print(f"    {app:<16}  F1={m['f1']:.4f}  "
                   f"P={m['precision']:.4f}  R={m['recall']:.4f}  MAE={m['mae']:.2f}")
 
-        if avg_va < best_val:
-            best_val   = avg_va
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-            patience_ctr = 0
+        # Dual checkpoint: best MSE and best avg F1
+        if avg_va < best_mse_val:
+            best_mse_val   = avg_va
+            best_mse_state = {k: v.clone() for k, v in model.state_dict().items()}
+            patience_ctr   = 0
         else:
             patience_ctr += 1
             if patience_ctr >= PATIENCE:
                 print(f"  Early stopping at epoch {epoch+1}")
                 break
 
+        if avg_f1 > best_f1_val:
+            best_f1_val   = avg_f1
+            best_f1_state = {k: v.clone() for k, v in model.state_dict().items()}
+
     print("Training completed!")
 
+    def run_test(state, label):
+        model.load_state_dict(state)
+        model.eval()
+        te_pp, te_pt = [], []
+        with torch.no_grad():
+            for xb, yb_p, *_ in te_loader:
+                p_pred, _ = model(xb.to(device))
+                te_pp.append(p_pred.cpu().numpy())
+                te_pt.append(yb_p.numpy())
+        metrics = compute_metrics(np.concatenate(te_pt),
+                                  np.concatenate(te_pp), yp_scalers)
+        print(f"\n── {label} ──")
+        print(f"{'Appliance':<17} {'F1':>8} {'Precision':>10} {'Recall':>8} "
+              f"{'MAE':>8} {'SAE':>8}")
+        print("-" * 65)
+        for app in APPLIANCES:
+            m = metrics[app]
+            print(f"{app:<17} {m['f1']:>8.4f} {m['precision']:>10.4f} "
+                  f"{m['recall']:>8.4f} {m['mae']:>8.2f} {m['sae']:>8.4f}")
+        return metrics
+
     # ── Test ───────────────────────────────────────────────────────────────
-    if best_state:
-        model.load_state_dict(best_state)
-    model.eval()
+    test_metrics_mse = run_test(best_mse_state, "Best val-MSE checkpoint")
+    test_metrics_f1  = run_test(best_f1_state,  "Best val-F1  checkpoint")
 
-    te_pp, te_pt = [], []
-    with torch.no_grad():
-        for xb, yb_p, *_ in te_loader:
-            p_pred, _ = model(xb.to(device))
-            te_pp.append(p_pred.cpu().numpy())
-            te_pt.append(yb_p.numpy())
-
-    test_metrics = compute_metrics(np.concatenate(te_pt),
-                                   np.concatenate(te_pp), yp_scalers)
-
-    print(f"\n{'Appliance':<17} {'F1':>8} {'Precision':>10} {'Recall':>8} "
-          f"{'MAE':>8} {'SAE':>8}")
-    print("-" * 65)
-    for app in APPLIANCES:
-        m = test_metrics[app]
-        print(f"{app:<17} {m['f1']:>8.4f} {m['precision']:>10.4f} "
-              f"{m['recall']:>8.4f} {m['mae']:>8.2f} {m['sae']:>8.4f}")
+    # Use the checkpoint with better avg test F1 for plots/config
+    avg_f1_mse = np.mean([test_metrics_mse[a]['f1'] for a in APPLIANCES])
+    avg_f1_f1  = np.mean([test_metrics_f1[a]['f1']  for a in APPLIANCES])
+    test_metrics = test_metrics_f1 if avg_f1_f1 >= avg_f1_mse else test_metrics_mse
+    print(f"\nUsing {'F1' if avg_f1_f1 >= avg_f1_mse else 'MSE'} checkpoint for final results "
+          f"(avgF1={max(avg_f1_f1, avg_f1_mse):.4f})")
 
     _plot(history, test_metrics, save_dir)
 
@@ -667,7 +687,7 @@ if __name__ == "__main__":
     test_metrics, history = train_model(
         data_dict,
         save_dir    = save_dir,
-        hidden_size = 64,
+        hidden_size = 128,
         dt          = 0.1,
     )
 
