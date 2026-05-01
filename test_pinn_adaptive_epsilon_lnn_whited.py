@@ -64,10 +64,14 @@ STRIDE        = 5
 
 LAMBDA_PHYS   = 0.01
 WARMUP_EPOCHS = 20
+RAMP_EPOCHS   = 15     # BCE ramps 0 → 1 over this many epochs after warmup
 
 # Adaptive epsilon
 K_SIGMA       = 1.0    # epsilon = mu_residual + K_SIGMA * sigma_residual
-EPSILON_FLOOR = 1.0    # minimum epsilon (W) to avoid floating-point instability
+# Floor must cover simultaneous appliance prediction noise, not just background
+# loads.  For WHITED (exact sum, no background) mu=sigma=0, so floor dominates.
+# 50W gives ~12% slack on fridge power (~408W), matching the original fixed value.
+EPSILON_FLOOR = 50.0   # minimum epsilon (W)
 
 APPLIANCES = ['fridge', 'microwave', 'washing machine', 'kettle']
 
@@ -107,6 +111,10 @@ def compute_epsilon(train_df, k=K_SIGMA, floor=EPSILON_FLOOR):
     mu     = float(resid.mean())
     sigma  = float(resid.std())
     eps    = max(mu + k * sigma, floor)
+    if mu < 1.0:
+        print(f"  [Note] mu_residual≈0: all monitored appliances account for "
+              f"~100% of aggregate. Epsilon floored at {floor:.1f} W to allow "
+              f"simultaneous appliance prediction noise.")
     return eps, mu, sigma
 
 
@@ -350,6 +358,9 @@ def train_pinn_model(data_dict, save_dir,
             if epoch < WARMUP_EPOCHS:
                 loss = mse_loss
             else:
+                # Linearly ramp BCE and physics 0 → 1 over RAMP_EPOCHS
+                ramp = min(1.0, (epoch - WARMUP_EPOCHS) / RAMP_EPOCHS)
+
                 bce_loss = torch.tensor(0.0, device=device)
                 for i, app in enumerate(APPLIANCES):
                     if BCE_LAMBDA[app] > 0:
@@ -360,7 +371,7 @@ def train_pinn_model(data_dict, save_dir,
                                              torch.ones_like(y_bin))
                         bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
                             pred_i, y_bin, weight=w)
-                loss = mse_loss + lambda_phys * phys_loss + bce_loss
+                loss = mse_loss + ramp * (lambda_phys * phys_loss + bce_loss)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -480,7 +491,8 @@ def train_pinn_model(data_dict, save_dir,
         },
         'train_params': {
             'lr': LR, 'epochs': EPOCHS, 'patience': PATIENCE,
-            'lambda_phys': lambda_phys, 'warmup_epochs': WARMUP_EPOCHS,
+            'lambda_phys': lambda_phys,
+            'warmup_epochs': WARMUP_EPOCHS, 'ramp_epochs': RAMP_EPOCHS,
         },
         'test_metrics': {
             app: {k: float(v) for k, v in m.items()}
