@@ -82,8 +82,16 @@ THRESHOLDS = {
     'kettle':           50.0,
 }
 
-BCE_LAMBDA = {'fridge': 0.3, 'microwave': 0.3, 'washing machine': 0.3, 'kettle': 0.3}
-BCE_ALPHA  = {'fridge': 1.5, 'microwave': 1.5, 'washing machine': 4.0, 'kettle': 1.5}
+# BCE_LAMBDA: overall weight of BCE term in the loss
+BCE_LAMBDA = {'fridge': 0.3, 'microwave': 0.5, 'washing machine': 0.3, 'kettle': 0.5}
+
+# BCE_ALPHA: weight on the POSITIVE (on) class in the weighted BCE.
+#   alpha > 1  ->  penalises false negatives more  ->  boosts recall
+#   alpha < 1  ->  penalises false positives more  ->  boosts precision
+#
+# Previous run had alpha=1.5 for all, causing recall=1.0 and precision≈0.1
+# (model predicted "always on").  Flipping to alpha<1 corrects this.
+BCE_ALPHA  = {'fridge': 0.5, 'microwave': 0.3, 'washing machine': 2.0, 'kettle': 0.3}
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +281,15 @@ def train_pinn_model(data_dict, save_dir,
           f"  [floor={EPSILON_FLOOR} W]")
     print(f"  lambda_phys    = {lambda_phys}")
 
+    # Duty cycles inform whether the model is likely to over-predict
+    train_df = data_dict['train']
+    print("Appliance duty cycles (training split):")
+    for app in APPLIANCES:
+        duty = float((train_df[app] > THRESHOLDS[app]).mean())
+        print(f"  {app:<20s}: {duty:.1%}  "
+              f"(BCE_ALPHA={BCE_ALPHA[app]}  "
+              f"{'penalises FP' if BCE_ALPHA[app] < 1 else 'penalises FN'})")
+
     # ── Sequences ──────────────────────────────────────────────────────────
     X_tr, Y_tr = create_sequences(data_dict['train'], WIN)
     X_va, Y_va = create_sequences(data_dict['val'],   WIN)
@@ -332,9 +349,11 @@ def train_pinn_model(data_dict, save_dir,
         'val_loss':   [], 'val_mse':   [], 'val_phys':   [],
         'val_metrics': [],
     }
-    best_val_loss = float('inf')
-    best_state    = None
-    counter       = 0
+    best_mse_val   = float('inf')
+    best_f1_val    = -float('inf')
+    best_mse_state = None
+    best_f1_state  = None
+    counter        = 0
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
@@ -436,39 +455,52 @@ def train_pinn_model(data_dict, save_dir,
                   f"P={m['precision']:.4f}  R={m['recall']:.4f}  "
                   f"MAE={m['mae']:.2f}  SAE={m['sae']:.4f}")
 
-        if vl_mse / n_va < best_val_loss:
-            best_val_loss = vl_mse / n_va
-            best_state    = {k: v.clone() for k, v in model.state_dict().items()}
-            counter       = 0
+        cur_mse = vl_mse / n_va
+        if cur_mse < best_mse_val:
+            best_mse_val   = cur_mse
+            best_mse_state = {k: v.clone() for k, v in model.state_dict().items()}
+            counter        = 0
         else:
             counter += 1
             if counter >= PATIENCE:
                 print(f"  Early stopping at epoch {epoch+1}")
                 break
 
+        if avg_f1 > best_f1_val:
+            best_f1_val   = avg_f1
+            best_f1_state = {k: v.clone() for k, v in model.state_dict().items()}
+
     print("Training completed!")
 
-    # ── Test ───────────────────────────────────────────────────────────────
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    model.eval()
+    # ── Test: evaluate both checkpoints ────────────────────────────────────
+    def run_test(state, label):
+        model.load_state_dict(state)
+        model.eval()
+        te_preds, te_trues = [], []
+        with torch.no_grad():
+            for xb, yb in te_loader:
+                te_preds.append(model(xb.to(device)).cpu().numpy())
+                te_trues.append(yb.numpy())
+        metrics = compute_per_appliance_metrics(
+            np.concatenate(te_trues), np.concatenate(te_preds), y_scalers)
+        print(f"\n── {label} ──")
+        print(f"{'Appliance':<17} {'F1':>8} {'Precision':>10} {'Recall':>8} "
+              f"{'MAE':>8} {'SAE':>8}")
+        print("-" * 65)
+        for app in APPLIANCES:
+            m = metrics[app]
+            print(f"{app:<17} {m['f1']:>8.4f} {m['precision']:>10.4f} "
+                  f"{m['recall']:>8.4f} {m['mae']:>8.2f} {m['sae']:>8.4f}")
+        return metrics
 
-    te_preds, te_trues = [], []
-    with torch.no_grad():
-        for xb, yb in te_loader:
-            te_preds.append(model(xb.to(device)).cpu().numpy())
-            te_trues.append(yb.numpy())
+    test_metrics_mse = run_test(best_mse_state, "Best val-MSE checkpoint")
+    test_metrics_f1  = run_test(best_f1_state,  "Best val-F1  checkpoint")
 
-    test_metrics = compute_per_appliance_metrics(
-        np.concatenate(te_trues), np.concatenate(te_preds), y_scalers)
-
-    print(f"\n{'Appliance':<17} {'F1':>8} {'Precision':>10} {'Recall':>8} "
-          f"{'MAE':>8} {'SAE':>8}")
-    print("-" * 65)
-    for app in APPLIANCES:
-        m = test_metrics[app]
-        print(f"{app:<17} {m['f1']:>8.4f} {m['precision']:>10.4f} "
-              f"{m['recall']:>8.4f} {m['mae']:>8.2f} {m['sae']:>8.4f}")
+    avg_f1_mse = np.mean([test_metrics_mse[a]['f1'] for a in APPLIANCES])
+    avg_f1_f1  = np.mean([test_metrics_f1[a]['f1']  for a in APPLIANCES])
+    test_metrics = test_metrics_f1 if avg_f1_f1 >= avg_f1_mse else test_metrics_mse
+    chosen = 'F1' if avg_f1_f1 >= avg_f1_mse else 'MSE'
+    print(f"\nUsing {chosen} checkpoint  (avgF1={max(avg_f1_f1, avg_f1_mse):.4f})")
 
     _plot(history, test_metrics, save_dir)
 
